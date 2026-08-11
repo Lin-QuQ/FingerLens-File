@@ -1,0 +1,12 @@
+name: fingerlens-file
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - tk
+  - pip
+  - pip:
+      - mediapipe==0.10.21
+      - opencv-contrib-python==4.11.0.86
+      - numpy==1.26.4
+      - imageio-ffmpeg==0.6.0

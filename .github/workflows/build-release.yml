@@ -1,0 +1,80 @@
+name: Build Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Verify runner architecture
+        shell: pwsh
+        run: |
+          $actual = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($actual -ne "X64") { throw "Expected Windows x64 runner, got $actual" }
+
+      - name: Install build dependencies
+        run: python -m pip install -r packaging/requirements-build.txt
+
+      - name: Run tests
+        run: python -m unittest -v
+
+      - name: Build application
+        env:
+          PYINSTALLER_CONFIG_DIR: ${{ runner.temp }}/pyinstaller
+        run: pyinstaller --noconfirm --clean FingerLensFile.spec
+
+      - name: Verify Windows executable architecture
+        shell: pwsh
+        run: |
+          $bytes = [System.IO.File]::ReadAllBytes("dist/FingerLensFile/FingerLensFile.exe")
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) { throw "Expected x64 PE (0x8664), got 0x$($machine.ToString('X4'))" }
+
+      - name: Smoke-test packaged application
+        shell: pwsh
+        run: |
+          & .\dist\FingerLensFile\FingerLensFile.exe --self-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package Windows bundle
+        shell: pwsh
+        run: |
+          $package = "release/FingerLens-File-Windows-x64"
+          New-Item -ItemType Directory -Force -Path $package | Out-Null
+          Copy-Item -Recurse -Force "dist/FingerLensFile/*" $package
+          Copy-Item -Force "packaging/使用说明.txt" $package
+          Copy-Item -Force "LICENSE" $package
+          Copy-Item -Force "THIRD_PARTY_NOTICES.md" $package
+          Compress-Archive -Path $package -DestinationPath "release/FingerLens-File-Windows-x64.zip" -CompressionLevel Optimal
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: FingerLens-File-Windows-x64
+          path: release/FingerLens-File-Windows-x64.zip
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" "release/FingerLens-File-Windows-x64.zip" --repo "${{ github.repository }}" --generate-notes --title "FingerLens File ${{ github.ref_name }}"
