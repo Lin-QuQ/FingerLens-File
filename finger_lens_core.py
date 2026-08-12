@@ -987,12 +987,18 @@ def draw_zones(
             if finger_mode == "two"
             else polygon_mask(source_roi.shape[:2], local_quad)
         )
-        alpha = (mask.astype(np.float32) / 255.0 * 0.94)[..., None]
         target_roi = overlay[y0:y1, x0:x1]
-        target_roi[:] = (
-            target_roi.astype(np.float32) * (1.0 - alpha)
-            + filtered_roi.astype(np.float32) * alpha
-        ).astype(np.uint8)
+        if filter_ids[zone] == 41:
+            # A chroma key must contain only #00FF00. Do not blend the source
+            # frame through anti-aliased mask values or through the usual 94%
+            # fashion-filter opacity.
+            target_roi[mask > 0] = filtered_roi[mask > 0]
+        else:
+            alpha = (mask.astype(np.float32) / 255.0 * 0.94)[..., None]
+            target_roi[:] = (
+                target_roi.astype(np.float32) * (1.0 - alpha)
+                + filtered_roi.astype(np.float32) * alpha
+            ).astype(np.uint8)
         subtle_white_polyline(overlay, quad)
     return overlay
 
