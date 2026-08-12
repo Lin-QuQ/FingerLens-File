@@ -12,6 +12,7 @@ from finger_lens_core import (
     FILTER_NAMES,
     FILTER_SETS,
     crossed_polygon_mask,
+    draw_zones,
     fashion_filter,
     is_l_gesture,
     subtle_white_polyline,
@@ -19,6 +20,7 @@ from finger_lens_core import (
 )
 from finger_lens_file import (
     ACTIVE_FILTER_IDS,
+    apply_video_orientation,
     DEFAULT_FIVE_SUITES,
     DEFAULT_TWO_FILTER_SEQUENCE,
     FILTER_CN_NAMES,
@@ -109,7 +111,7 @@ class FileVersionTests(unittest.TestCase):
     def test_reviewed_filter_selection_is_applied_to_defaults(self):
         expected = {7, 8, 11, 12, 13, 15, 18, 19, 22, 25, 26, 27, 29, 33, 34, 38, 39, 41, 42, 43, 44, 45, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59}
         self.assertEqual(set(ACTIVE_FILTER_IDS), expected)
-        self.assertEqual(set(DEFAULT_TWO_FILTER_SEQUENCE), expected)
+        self.assertEqual(DEFAULT_TWO_FILTER_SEQUENCE, ())
         self.assertTrue(all(filter_id in expected for suite in DEFAULT_FIVE_SUITES for filter_id in suite))
         self.assertEqual(set(filter_id for suite in DEFAULT_FIVE_SUITES for filter_id in suite), expected)
         self.assertEqual(DEFAULT_FIVE_SUITES[-1], (41, 41, 41, 41))
@@ -172,6 +174,27 @@ class FileVersionTests(unittest.TestCase):
         # the actual stroke remains one pixel wide.
         self.assertLessEqual(int(np.count_nonzero(np.any(frame > 0, axis=2)[30, 7:14])), 3)
 
+    def test_green_screen_zone_is_fully_opaque(self):
+        frame = np.random.default_rng(32).integers(0, 256, (64, 64, 3), dtype=np.uint8)
+        left = np.zeros((21, 2), dtype=np.float32)
+        right = np.zeros((21, 2), dtype=np.float32)
+        left[4], left[8] = (10, 10), (10, 50)
+        right[8], right[4] = (50, 10), (50, 50)
+        output = draw_zones(
+            frame,
+            {"Left": left, "Right": right},
+            phase=9.5,
+            style=1,
+            finger_mode="two",
+            custom_filter_ids=(41,),
+        )
+        quad = np.array([left[4], left[8], right[8], right[4]], dtype=np.float32)
+        mask = crossed_polygon_mask(frame.shape[:2], quad)
+        expected = frame.copy()
+        expected[mask > 0] = (0, 255, 0)
+        subtle_white_polyline(expected, quad)
+        np.testing.assert_array_equal(output, expected)
+
     def test_complete_suites_can_be_drag_reordered(self):
         suites = [(1, 2, 3, 4), (5, 6, 7, 8), (9, 10, 11, 12)]
         self.assertEqual(reorder_suites(suites, 0, 2), [suites[1], suites[2], suites[0]])
@@ -181,7 +204,9 @@ class FileVersionTests(unittest.TestCase):
     def test_two_finger_custom_sequence_speed_and_wraparound(self):
         suites = ((1, 2, 3, 4), (5, 6, 7, 8))
         sequence = (42, 51, 41)
-        self.assertEqual(filters_for_time("two", sequence, suites, None, 99.0), ((42,), 0))
+        for elapsed in (0.0, 1.0, 99.0, 3600.0):
+            self.assertEqual(filters_for_time("two", sequence, suites, None, elapsed), ((42,), 0))
+            self.assertEqual(filters_for_time("two", (41,), suites, None, elapsed), ((41,), 0))
         self.assertEqual(filters_for_time("two", sequence, suites, 1.0, 0.0), ((42,), 0))
         self.assertEqual(filters_for_time("two", sequence, suites, 1.0, 1.0), ((51,), 1))
         self.assertEqual(filters_for_time("two", sequence, suites, 1.0, 2.0), ((41,), 2))
@@ -219,6 +244,20 @@ class FileVersionTests(unittest.TestCase):
             self.assertAlmostEqual(fps, 12.0, places=1)
             self.assertGreaterEqual(frames, 3)
             self.assertEqual(preview.shape, (48, 64, 3))
+
+    def test_manual_video_orientation_fallback(self):
+        frame = np.zeros((30, 50, 3), dtype=np.uint8)
+        frame[:10, :15] = (3, 40, 220)
+        clockwise = apply_video_orientation(frame, 90)
+        upside_down = apply_video_orientation(frame, 180)
+        counterclockwise = apply_video_orientation(frame, 270)
+        self.assertEqual(clockwise.shape, (50, 30, 3))
+        self.assertEqual(upside_down.shape, frame.shape)
+        self.assertEqual(counterclockwise.shape, (50, 30, 3))
+        np.testing.assert_array_equal(clockwise, cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE))
+        np.testing.assert_array_equal(upside_down, cv2.rotate(frame, cv2.ROTATE_180))
+        np.testing.assert_array_equal(counterclockwise, cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        self.assertIs(apply_video_orientation(frame, 0), frame)
 
 
 if __name__ == "__main__":

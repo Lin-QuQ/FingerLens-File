@@ -89,11 +89,7 @@ ACTIVE_FILTER_IDS = (
 FILTER_OPTIONS = tuple(FILTER_CN_NAMES[number] for number in ACTIVE_FILTER_IDS)
 FILTER_ID_BY_OPTION = {FILTER_CN_NAMES[number]: number for number in ACTIVE_FILTER_IDS}
 FINGER_ZONE_NAMES = ("拇指—食指", "食指—中指", "中指—无名指", "无名指—小指")
-DEFAULT_TWO_FILTER_SEQUENCE = (
-    25, 51, 26, 27, 29, 52, 38, 39, 42, 53, 11, 22, 43, 54,
-    18, 19, 44, 55, 7, 13, 45, 56, 8, 12, 33, 50, 34, 57,
-    15, 58, 59, 41,
-)
+DEFAULT_TWO_FILTER_SEQUENCE: tuple[int, ...] = ()
 DEFAULT_FIVE_SUITES = (
     (25, 51, 26, 27),
     (29, 52, 38, 39),
@@ -273,18 +269,49 @@ def find_ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
 
+def configure_video_orientation(capture: cv2.VideoCapture) -> int:
+    """Enable backend auto-rotation and return a manual fallback angle."""
+    meta_property = getattr(cv2, "CAP_PROP_ORIENTATION_META", None)
+    auto_property = getattr(cv2, "CAP_PROP_ORIENTATION_AUTO", None)
+    orientation = 0
+    if meta_property is not None:
+        value = capture.get(meta_property)
+        if np.isfinite(value):
+            orientation = int(round(value)) % 360
+    if auto_property is not None:
+        capture.set(auto_property, 1)
+        if capture.get(auto_property) >= 0.5:
+            return 0
+    return orientation if orientation in (90, 180, 270) else 0
+
+
+def apply_video_orientation(frame: np.ndarray, clockwise_degrees: int) -> np.ndarray:
+    """Apply metadata rotation when the capture backend cannot do it."""
+    angle = int(round(clockwise_degrees)) % 360
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
 def video_metadata(path: Path) -> tuple[int, int, float, int, np.ndarray]:
     capture = cv2.VideoCapture(str(path))
     try:
         if not capture.isOpened():
             raise ValueError("无法打开这个视频，请确认文件没有损坏，并尝试转换为 MP4 或 MOV。")
-        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fallback_orientation = configure_video_orientation(capture)
         fps = float(capture.get(cv2.CAP_PROP_FPS))
         frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         ok, preview = capture.read()
-        if not ok or preview is None or width <= 0 or height <= 0:
+        if not ok or preview is None:
             raise ValueError("读取不到视频画面，请尝试转换为 MP4 或 MOV。")
+        preview = apply_video_orientation(preview, fallback_orientation)
+        height, width = preview.shape[:2]
+        if width <= 0 or height <= 0:
+            raise ValueError("读取不到有效的视频尺寸，请尝试转换为 MP4 或 MOV。")
         if not np.isfinite(fps) or fps <= 1e-3:
             fps = 30.0
         return width, height, fps, frames, preview
@@ -387,6 +414,7 @@ def _ffmpeg_command(
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "192k",
+        "-metadata:s:v:0", "rotate=0",
         "-movflags", "+faststart",
         "-shortest",
         str(destination),
@@ -415,6 +443,7 @@ def process_video(
     capture = cv2.VideoCapture(str(source))
     if not capture.isOpened():
         raise RuntimeError("视频在开始处理时无法打开。")
+    fallback_orientation = configure_video_orientation(capture)
 
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
     encoder = subprocess.Popen(
@@ -427,6 +456,17 @@ def process_video(
     smoother = SmoothLandmarks(0.58)
     frame_index = 0
     preview_every = max(1, round(fps / 4.0))
+    locked_selection = (
+        filters_for_time(
+            finger_mode,
+            two_filter_sequence,
+            filter_suites,
+            switch_interval,
+            0.0,
+        )
+        if switch_interval is None
+        else None
+    )
 
     try:
         with make_landmarker(ensure_model(model_path)) as landmarker:
@@ -434,6 +474,7 @@ def process_video(
                 ok, frame = capture.read()
                 if not ok:
                     break
+                frame = apply_video_orientation(frame, fallback_orientation)
                 scale = min(1.0, detect_width / max(width, 1))
                 detection = (
                     cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -446,13 +487,16 @@ def process_video(
                 hands = normalize_hands(result, width, height, smoother, selfie_mirrored=False)
 
                 elapsed = frame_index / fps
-                current_filter_ids, suite_index = filters_for_time(
-                    finger_mode,
-                    two_filter_sequence,
-                    filter_suites,
-                    switch_interval,
-                    elapsed,
-                )
+                if locked_selection is not None:
+                    current_filter_ids, suite_index = locked_selection
+                else:
+                    current_filter_ids, suite_index = filters_for_time(
+                        finger_mode,
+                        two_filter_sequence,
+                        filter_suites,
+                        switch_interval,
+                        elapsed,
+                    )
                 style = suite_index + 1
 
                 phase = frame_index / fps * 2.2
@@ -521,7 +565,7 @@ class FingerLensFileApp:
         self.filter_preview_photos: list[tk.PhotoImage] = []
         self.mode_var = tk.StringVar(value="two")
         self.two_filters = list(DEFAULT_TWO_FILTER_SEQUENCE)
-        self.two_add_var = tk.StringVar(value=self._filter_option(DEFAULT_TWO_FILTER_SEQUENCE[0]))
+        self.two_add_var = tk.StringVar(value=FILTER_OPTIONS[0])
         self.two_drag_index: int | None = None
         self.suites = [tuple(filters) for filters in DEFAULT_FIVE_SUITES]
         self.selected_suite_index = 0
@@ -749,11 +793,23 @@ class FingerLensFileApp:
             self._render_two_filter_list()
             self.two_canvas.yview_moveto(1.0)
             self.status_var.set(f"已将 {FILTER_CN_NAMES[filter_id]} 添加到双指滤镜队尾")
+            self._update_start_button()
 
     def _render_two_filter_list(self) -> None:
         for child in self.two_inner.winfo_children():
             child.destroy()
         self.two_rows = []
+        if not self.two_filters:
+            tk.Label(
+                self.two_inner,
+                text="尚未选择滤镜\n请点击 02 中的预览，或使用下方菜单添加",
+                fg="#9fa4b2",
+                bg="#191b22",
+                font=("Helvetica", 9),
+                justify="center",
+                pady=24,
+            ).pack(fill="x", padx=8, pady=8)
+            return
         for index, filter_id in enumerate(self.two_filters):
             bg = "#24262f"
             row = tk.Frame(self.two_inner, bg=bg, highlightbackground="#3d414d", highlightthickness=1)
@@ -780,14 +836,17 @@ class FingerLensFileApp:
         self._render_two_filter_list()
         self.two_canvas.yview_moveto(1.0)
         self.status_var.set(f"已添加 {FILTER_CN_NAMES[filter_id]}")
+        self._update_start_button()
 
     def _delete_two_filter(self, index: int) -> None:
-        if len(self.two_filters) <= 1:
-            messagebox.showwarning(APP_NAME, "双指模式至少要保留一个滤镜。")
-            return
         removed = self.two_filters.pop(index)
         self._render_two_filter_list()
-        self.status_var.set(f"已删除 {FILTER_CN_NAMES[removed]}")
+        self.status_var.set(
+            f"已删除 {FILTER_CN_NAMES[removed]}"
+            if self.two_filters
+            else "双指滤镜已清空，请至少选择一个滤镜"
+        )
+        self._update_start_button()
 
     def _two_drag_start(self, index: int) -> None:
         self.two_drag_index = index
@@ -816,12 +875,23 @@ class FingerLensFileApp:
         self.five_frame.pack_forget()
         if self.mode_var.get() == "two":
             self.double_frame.pack(fill="both", expand=True)
-            message = "双指模式：按自定义滤镜顺序和切换速度循环"
+            message = (
+                "双指模式：按自定义滤镜顺序和切换速度循环"
+                if self.two_filters
+                else "双指模式：请从 02 滤镜预览中至少选择一个滤镜"
+            )
         else:
             self.five_frame.pack(fill="both", expand=True)
             message = "五指模式：按左侧套装顺序和切换速度自动切换"
         if self.source:
             self.status_var.set(message)
+        self._update_start_button()
+
+    def _update_start_button(self) -> None:
+        worker_busy = bool(self.worker and self.worker.is_alive())
+        selection_ready = self.mode_var.get() != "two" or bool(self.two_filters)
+        state = "normal" if self.source and selection_ready and not worker_busy else "disabled"
+        self.start_button.configure(state=state)
 
     def _suite_summary(self, filters: tuple[int, ...]) -> str:
         return " · ".join(FILTER_CN_NAMES[number] for number in filters)
@@ -947,8 +1017,12 @@ class FingerLensFileApp:
         duration = frames / fps if frames > 0 else 0.0
         self.file_label.configure(text=path.name)
         self.detail_var.set(f"{width} × {height}  ·  {fps:.2f} FPS  ·  {duration:.1f} 秒")
-        self.start_button.configure(state="normal")
-        self.status_var.set("视频已就绪，请检查 03 模式与滤镜")
+        self._update_start_button()
+        self.status_var.set(
+            "视频已就绪，请至少选择一个双指滤镜"
+            if self.mode_var.get() == "two" and not self.two_filters
+            else "视频已就绪，请检查 03 模式与滤镜"
+        )
         try:
             self._show_video_frame(preview)
         except Exception:
@@ -957,6 +1031,9 @@ class FingerLensFileApp:
 
     def start(self) -> None:
         if not self.source:
+            return
+        if self.mode_var.get() == "two" and not self.two_filters:
+            messagebox.showwarning(APP_NAME, "双指模式没有默认滤镜，请先选择至少一个滤镜。")
             return
         if self.mode_var.get() == "five" and self.draft_dirty:
             messagebox.showwarning(APP_NAME, "当前滤镜槽尚未确定。请先点击“确定并更新该套装”。")
@@ -1033,7 +1110,7 @@ class FingerLensFileApp:
         self.root.after(100, self._poll_events)
 
     def _finish_ui(self) -> None:
-        self.start_button.configure(state="normal" if self.source else "disabled")
+        self._update_start_button()
         self.cancel_button.configure(state="disabled")
 
     def _on_close(self) -> None:
