@@ -47,6 +47,16 @@ from finger_lens_core import (
 
 
 APP_NAME = "FingerLens 文件版"
+EXPORT_QUALITY_OPTIONS = (
+    "极致画质（文件较大）",
+    "高画质（推荐）",
+    "节省空间（文件较小）",
+)
+EXPORT_CRF_BY_OPTION = {
+    EXPORT_QUALITY_OPTIONS[0]: 14,
+    EXPORT_QUALITY_OPTIONS[1]: 18,
+    EXPORT_QUALITY_OPTIONS[2]: 22,
+}
 SUPPORTED_EXTENSIONS = {
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm", ".wmv", ".mpg", ".mpeg",
 }
@@ -393,7 +403,10 @@ def _ffmpeg_command(
     width: int,
     height: int,
     fps: float,
+    video_crf: int,
 ) -> list[str]:
+    if video_crf not in EXPORT_CRF_BY_OPTION.values():
+        raise ValueError(f"不支持的导出质量参数：CRF {video_crf}")
     return [
         executable,
         "-y",
@@ -409,7 +422,7 @@ def _ffmpeg_command(
         "-map", "1:a?",
         "-c:v", "libx264",
         "-preset", "medium",
-        "-crf", "18",
+        "-crf", str(video_crf),
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac",
@@ -430,6 +443,7 @@ def process_video(
     switch_interval: float | None,
     model_path: Path,
     detect_width: int,
+    video_crf: int,
     cancel_event: threading.Event,
     update,
 ) -> None:
@@ -447,7 +461,7 @@ def process_video(
 
     creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
     encoder = subprocess.Popen(
-        _ffmpeg_command(ffmpeg, source, destination, width, height, fps),
+        _ffmpeg_command(ffmpeg, source, destination, width, height, fps, video_crf),
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -575,6 +589,7 @@ class FingerLensFileApp:
         self.slot_vars = [tk.StringVar() for _ in range(4)]
         self.double_speed_var = tk.StringVar(value="2")
         self.five_speed_var = tk.StringVar(value="2")
+        self.export_quality_var = tk.StringVar(value=EXPORT_QUALITY_OPTIONS[1])
         self.status_var = tk.StringVar(value="选择视频后即可开始")
         self.detail_var = tk.StringVar(value="支持 MP4、MOV、M4V、AVI、MKV、WebM、WMV、MPG")
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -666,6 +681,18 @@ class FingerLensFileApp:
         self.cancel_button.pack(side="right", padx=(10, 0))
         self.start_button = ColorButton(actions, text="开始处理并导出", command=self.start, state="disabled", normal_bg="#7048ff", hover_bg="#876aff", padx=28, pady=11)
         self.start_button.pack(side="right")
+        quality = tk.Frame(actions, bg="#101116")
+        quality.pack(side="right", padx=(0, 12))
+        tk.Label(quality, text="导出质量", fg="#f4f5f8", bg="#101116", font=("Helvetica", 9, "bold")).pack(anchor="w")
+        quality_combo = ttk.Combobox(
+            quality,
+            textvariable=self.export_quality_var,
+            values=EXPORT_QUALITY_OPTIONS,
+            state="readonly",
+            style="Filter.TCombobox",
+            width=19,
+        )
+        quality_combo.pack()
 
     def _build_double_config(self) -> None:
         self.double_frame = tk.Frame(self.mode_content, bg="#191b22")
@@ -1057,13 +1084,14 @@ class FingerLensFileApp:
         filter_suites = tuple(self.suites)
         speed_value = self.double_speed_var.get() if finger_mode == "two" else self.five_speed_var.get()
         switch_interval = None if speed_value == "never" else float(speed_value)
+        video_crf = EXPORT_CRF_BY_OPTION[self.export_quality_var.get()]
 
         def update(progress, frame_index, total_frames, current_label, frame):
             self.events.put(("progress", progress, frame_index, total_frames, current_label, frame))
 
         def work() -> None:
             try:
-                process_video(source, destination, finger_mode, two_filter_sequence, filter_suites, switch_interval, resource_path("models/hand_landmarker.task"), 960, self.cancel_event, update)
+                process_video(source, destination, finger_mode, two_filter_sequence, filter_suites, switch_interval, resource_path("models/hand_landmarker.task"), 960, video_crf, self.cancel_event, update)
                 self.events.put(("done", destination))
             except InterruptedError:
                 self.events.put(("cancelled",))

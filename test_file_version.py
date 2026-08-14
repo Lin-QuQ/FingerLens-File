@@ -20,12 +20,15 @@ from finger_lens_core import (
 )
 from finger_lens_file import (
     ACTIVE_FILTER_IDS,
+    _ffmpeg_command,
     apply_video_orientation,
     DEFAULT_FIVE_SUITES,
     DEFAULT_TWO_FILTER_SEQUENCE,
     FILTER_CN_NAMES,
     FILTER_ID_BY_OPTION,
     FILTER_OPTIONS,
+    EXPORT_CRF_BY_OPTION,
+    EXPORT_QUALITY_OPTIONS,
     filters_for_time,
     preview_png_data,
     reorder_items,
@@ -56,6 +59,28 @@ def rotate(points: np.ndarray, degrees: float) -> np.ndarray:
 
 
 class FileVersionTests(unittest.TestCase):
+    def test_export_quality_options_map_to_expected_crf(self):
+        self.assertEqual(
+            [EXPORT_CRF_BY_OPTION[option] for option in EXPORT_QUALITY_OPTIONS],
+            [14, 18, 22],
+        )
+        for option, expected_crf in EXPORT_CRF_BY_OPTION.items():
+            command = _ffmpeg_command(
+                "ffmpeg",
+                Path("input.mp4"),
+                Path("output.mp4"),
+                1920,
+                1080,
+                29.97,
+                expected_crf,
+            )
+            crf_index = command.index("-crf")
+            self.assertEqual(command[crf_index + 1], str(expected_crf), option)
+            self.assertIn("1920x1080", command)
+            self.assertIn("29.97000000", command)
+        with self.assertRaises(ValueError):
+            _ffmpeg_command("ffmpeg", Path("in.mp4"), Path("out.mp4"), 640, 480, 30.0, 7)
+
     def test_filter_review_result_lists_keep_drop_and_pending(self):
         result = format_review_results({50: "keep", 51: "drop", 60: "keep"})
         self.assertIn("保留（2 个）", result)
